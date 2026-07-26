@@ -1,0 +1,176 @@
+name: Auto-Build latest apk for degoogled devices
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    name: Check for New Upstream Tags
+    runs-on: ubuntu-latest
+    outputs:
+      new_tag: ${{ steps.check.outputs.new_tag }}
+    steps:
+      - name: Check for new tag
+        id: check
+        run: |
+          git clone --bare https://github.com/cagnulein/qdomyos-zwift.git upstream
+          cd upstream
+          
+          LATEST_TAG=$(git tag | grep -E '^[0-9]+(\.[0-9]+)+$' | sort -V | tail -n 1)
+          echo "Latest upstream stable tag: $LATEST_TAG"
+          
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No valid stable tag found."
+            echo "new_tag=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          if gh release view "$LATEST_TAG" --repo ${{ github.repository }} > /dev/null 2>&1; then
+            echo "Release $LATEST_TAG already exists. Skipping build."
+            echo "new_tag=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New valid tag found: $LATEST_TAG"
+            echo "new_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    name: Build & Release Single-ABI APK
+    needs: check
+    if: needs.check.outputs.new_tag != 'false'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Upstream Code
+        uses: actions/checkout@v4
+        with:
+          repository: cagnulein/qdomyos-zwift
+          ref: ${{ needs.check.outputs.new_tag }}
+          submodules: recursive
+
+      - name: Install Qt System Dependencies
+        run: |
+          sudo apt update -y
+          sudo apt-get install -y qtbase5-dev qtchooser qt5-qmake qtbase5-dev-tools qttools5-dev-tools qtquickcontrols2-5-dev libqt5bluetooth5 libqt5widgets5 libqt5positioning5 libqt5xml5 qtconnectivity5-dev qtpositioning5-dev libqt5charts5-dev libqt5charts5 libqt5networkauth5-dev libqt5websockets5* libxcb-randr0-dev libxcb-xtest0-dev libxcb-xinerama0-dev libxcb-shape0-dev libxcb-xkb-dev
+
+      - name: Install Qt Android Environment
+        uses: jdpurcell/install-qt-action@v5
+        with:
+          version: '5.15.2'
+          host: 'linux'
+          target: 'android'
+          arch: 'android'
+          modules: 'qtcharts qtnetworkauth'
+
+      - name: Set up Java 17 (Required by Android SDK & Gradle 8+)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install Android SDK Packages & NDK r21e
+        run: |
+          SDKMANAGER="/usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager"
+          echo "y" | $SDKMANAGER "ndk;21.1.6352462" "platforms;android-35" "build-tools;35.0.0"
+          echo "ANDROID_NDK_ROOT=/usr/local/lib/android/sdk/ndk/21.1.6352462" >> $GITHUB_ENV
+
+      - name: Build qthttpserver for Android
+        run: |
+          cd src/qthttpserver
+          qmake
+          make -j8
+          make install
+
+      - name: Build APK (Single-ABI arm64-v8a Optimized)
+        working-directory: ./src
+        run: |
+          find translations/ -name "*.ts" -exec lrelease {} \;
+          
+          rm -rf build && mkdir -p build && cd build
+
+          # 'ANDROID_ABIS=armeabi-v7a arm64-v8a x86 x86_64' for FULL arch support
+          qmake ../qdomyos-zwift.pro -spec android-clang \
+            'ANDROID_ABIS=arm64-v8a' \
+            'CONFIG+=release' \
+            QMAKE_CXXFLAGS+="-Wno-error=inconsistent-missing-override -Wno-error=overloaded-virtual -Wno-error=return-type"
+          
+          make -j4
+          make INSTALL_ROOT=${{ github.workspace }}/output/android install
+          
+          cd ..
+          mkdir -p ${{ github.workspace }}/output/android
+          rsync -a --exclude build --exclude .gradle android/ ${{ github.workspace }}/output/android/
+          cd build
+
+          mkdir -p ${{ github.workspace }}/output/android/res
+
+          androiddeployqt --input android-qdomyos-zwift-deployment-settings.json \
+                          --output ${{ github.workspace }}/output/android \
+                          --android-platform android-35 \
+                          --jdk $JAVA_HOME \
+                          --gradle \
+                          --aux-mode \
+                          --release
+
+          find ${{ github.workspace }}/output/android -type f \( -name "*.properties" -o -name "*.gradle" \) -exec sed -i '/android\.bundle\.enableUncompressedNativeLibs/d' {} +
+
+          export QT_ANDROID_DIR=$(qmake -query QT_INSTALL_PREFIX)
+          sed -i '/^qt5AndroidDir=/d' ${{ github.workspace }}/output/android/gradle.properties
+          printf '\nqt5AndroidDir=%s/src/android/java\n' "$QT_ANDROID_DIR" >> ${{ github.workspace }}/output/android/gradle.properties
+
+          export GRADLE_USER_HOME="${{ github.workspace }}/.gradle-android"
+          mkdir -p "$GRADLE_USER_HOME"
+
+          if [ ! -d "${{ github.workspace }}/gradle-8.13" ]; then
+            curl -fsSL https://services.gradle.org/distributions/gradle-8.13-bin.zip -o /tmp/gradle-8.13-bin.zip
+            unzip -q /tmp/gradle-8.13-bin.zip -d ${{ github.workspace }}
+          fi
+          
+          ${{ github.workspace }}/gradle-8.13/bin/gradle -g "$GRADLE_USER_HOME" --no-daemon -p ${{ github.workspace }}/output/android assembleRelease bundleRelease
+
+      - name: Prepare Android signing key
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        run: |
+          if [ -z "$SIGNING_KEY" ] || [ -z "${{ secrets.ALIAS }}" ] || [ -z "${{ secrets.KEY_STORE_PASSWORD }}" ] || [ -z "${{ secrets.KEY_PASSWORD }}" ]; then
+            echo "Android signing secrets are required; aborting."
+            exit 1
+          fi
+          KEYSTORE="${{ github.workspace }}/ci-signing-key.jks"
+          printf '%s' "$SIGNING_KEY" | base64 --decode > "$KEYSTORE"
+          if [ ! -s "$KEYSTORE" ]; then
+            echo "Failed to decode Android signing key."
+            rm -f "$KEYSTORE"
+            exit 1
+          fi
+          echo "CI_ANDROID_SIGNING_KEYSTORE=$KEYSTORE" >> "$GITHUB_ENV"
+
+      - name: Sign APK
+        run: |
+          APK_PATH="${{ github.workspace }}/output/android/build/outputs/apk/release/android-release-unsigned.apk"
+          APKSIGNER=$(find /usr/local/lib/android/sdk/build-tools -name apksigner | sort | tail -n 1)
+          "$APKSIGNER" sign \
+            --ks "$CI_ANDROID_SIGNING_KEYSTORE" \
+            --ks-key-alias "${{ secrets.ALIAS }}" \
+            --ks-pass "pass:${{ secrets.KEY_STORE_PASSWORD }}" \
+            --key-pass "pass:${{ secrets.KEY_PASSWORD }}" \
+            --out "${{ github.workspace }}/output/android-release-signed.apk" \
+            "$APK_PATH"
+          rm -f "$CI_ANDROID_SIGNING_KEYSTORE"
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check.outputs.new_tag }}
+          name: Release ${{ needs.check.outputs.new_tag }}
+          files: ${{ github.workspace }}/output/android-release-signed.apk
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
